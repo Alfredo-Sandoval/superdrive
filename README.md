@@ -1,198 +1,142 @@
 # SuperDrive Helper
 
-A Linux GUI and CLI for slot‑loading Apple USB SuperDrive drives — and any
-other optical drive that speaks SCSI through `sg3_utils`.
+![Python](https://img.shields.io/badge/python-3.10--3.12-blue)
+![GUI](https://img.shields.io/badge/gui-PySide6-41cd52)
+![CLI](https://img.shields.io/badge/cli-Typer-0f766e)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-Apple's slot‑loading SuperDrive (USB ID `05ac:1500`) refuses to spin up under
-Linux until it receives a vendor‑specific "wake" command. SuperDrive Helper
-sends that command for you, then exposes the everyday operations — eject,
-lock/unlock door, status, autosuspend — through a small PySide6 GUI **and** a
-scriptable Typer CLI.
+Linux support for the Apple SuperDrive.
 
+SuperDrive Helper is a small GUI and CLI for using Apple's USB SuperDrive on
+Linux.
+
+The slot-loading Apple SuperDrive (USB ID `05ac:1500`) does not fully initialize
+as a normal USB optical drive on Linux. It can appear as `/dev/sr0`, but still
+ignore inserted discs until it receives an Apple-specific SCSI command. macOS
+sends this command automatically. On Linux, it has to be sent explicitly:
+
+```sh
+sg_raw /dev/srX EA 00 00 00 00 00 01
 ```
-sg_raw /dev/srX EA 00 00 00 00 00 01   # the magic Apple wake CDB
-```
 
----
+SuperDrive Helper sends that command for supported Apple drives and provides
+the related controls that are useful afterward:
 
-## Features
+- Detect optical drives and identify Apple SuperDrives by USB ID.
+- Send the Apple wake command so the drive accepts a disc.
+- Eject discs, with an auto-unmount step before eject.
+- Lock or unlock the drive door during burns.
+- Check drive status and probe details.
+- Disable USB autosuspend for the drive's port when Linux power management gets
+  in the way.
 
-- **Apple wake**: sends the Apple‑specific `0xEA` CDB so the drive accepts a disc
-- **Auto‑detection**: enumerates `/dev/sr*` and tags Apple SuperDrives by USB ID
-- **Eject with auto‑unmount**: unmounts via `udisksctl` or `umount` before ejecting
-- **Door lock / unlock**: SCSI Prevent/Allow Medium Removal — useful during burns
-- **Status & inquiry**: Test Unit Ready plus `sg_inq` summary when available
-- **USB autosuspend toggle**: keep flaky slot‑loaders from browning out
-- **Stable CLI**: JSON output, dry‑run, fixed exit codes — built for agents and scripts
-- **Safe by construction**: fixed `PATH`, no shell, per‑command timeouts, hotplug rechecks
+The GUI is built with PySide6. The CLI is built with Typer and supports JSON
+output for scripts.
 
----
-
-## Requirements
-
-| Component | Notes |
-|---|---|
-| Python | 3.10 – 3.12 |
-| `sg3_utils` | `sudo apt install sg3-utils` |
-| PySide6 (Qt) | for the GUI only — CLI works without it |
-| Access to `/dev/srX` | usually means being in the `cdrom` group |
-
----
+![SuperDrive Helper GUI](docs/screenshot.png)
 
 ## Install
 
-### Conda (recommended)
+From the repo root:
+
+```bash
+sudo apt install sg3-utils
+python -m pip install .
+```
+
+`sg3-utils` provides the low-level SCSI tools used to talk to the drive.
+
+If you prefer conda:
 
 ```bash
 conda env create -f environment.yml
 conda activate superdrive
-sudo apt install sg3-utils   # system package, not on conda-forge
+sudo apt install sg3-utils   # not on conda-forge
+python -m pip install .
 ```
 
-### pip
-
-```bash
-python3 -m pip install --user PySide6 typer
-sudo apt install sg3-utils
-```
-
-### Development install
-
-```bash
-python3 -m pip install -e ".[dev]"
-```
-
----
-
-## Run
-
-**GUI**
-
-```bash
-python3 -m superdrive.gui.main_window   # or, once installed:
-superdrive-helper
-```
-
-**CLI**
-
-```bash
-superdrive-cli --version
-superdrive-cli device list --json
-superdrive-cli device status --json --device /dev/sr0
-```
-
----
-
-## CLI for scripts and agents
-
-Reads are non‑mutating. Hardware‑changing commands (`load`, `eject`, `lock`,
-`power`) require **either** `--dry-run` **or** `--yes`, so a script can
-validate intent before touching the drive.
-
-```bash
-# Dry-run first
-superdrive-cli device load --dry-run --json --device /dev/sr0
-
-# Actually do it
-superdrive-cli device load --yes    --json --device /dev/sr0
-```
-
-In `--json` mode, success payloads go to **stdout**; failures go to **stderr** as:
-
-```json
-{"error": {"message": "...", "hint": "...", "details": {}}}
-```
-
-Exit codes (stable):
-
-| Code | Meaning |
-|---|---|
-| `0` | success |
-| `1` | generic operation failure |
-| `2` | config / input error |
-| `3` | not found |
-
-Run `superdrive-cli schema describe --json` to dump the live command contract.
-
----
-
-## GUI buttons, briefly
-
-| Button | What it does |
-|---|---|
-| **Load / Accept Disc** | Sends Apple CDB `0xEA 00 00 00 00 00 01`. Only enabled for `05ac:1500`. |
-| **Eject (Auto‑unmount)** | Unmounts (udisksctl → umount), then `sg_start --eject` (falls back to `eject`). |
-| **Allow Eject (Unlock)** | Clears SCSI Prevent/Allow — door can open. |
-| **Prevent Eject (Lock)** | Sets SCSI Prevent/Allow — door stays shut (use during burns). |
-| **Check Status** | Mount state + Test Unit Ready + `sg_inq` summary if installed. |
-| **Keep Port Powered** | Disables USB autosuspend on the underlying port via sysfs. Temporary; needs sudo. |
-
-A modal "Working" dialog and a status‑bar progress bar appear during actions,
-and other controls are disabled to prevent overlapping commands.
-
----
-
-## Permissions
-
-If you see permission errors on `/dev/srX`:
+Most Linux systems require your user to be in the `cdrom` group before it can
+access `/dev/sr0` directly:
 
 ```bash
 sudo usermod -aG cdrom "$USER"
 newgrp cdrom
 ```
 
-Don't run the whole GUI as root. The **Keep Port Powered** action writes to
-sysfs and may need elevation — the app prints the exact commands to copy, or
-you can install a local udev rule.
+## GUI
 
----
+Launch it with:
 
-## Architecture
-
-Strict layering — the CLI and drive layers do not import from `gui`:
-
-```
-superdrive/
-  commands.py            subprocess adapter for sg3_utils, mount, holders
-  drive.py               device model, discovery service, controller facade
-  cli/                   Typer command surface split by resource
-  gui/                   Qt widgets and compact styling
+```bash
+superdrive-helper
 ```
 
-Safety guarantees baked in:
-- External commands resolve from a fixed safe `PATH` (`/usr/sbin:/usr/bin:/sbin:/bin`)
-- Shell execution is disabled everywhere
-- Every command has a timeout
-- Before each hardware action, the selected `/dev/srX` is re‑checked against
-  sysfs so hotplug or device reuse cannot silently target the wrong drive
+The main controls are:
 
----
+- **Load / Accept Disc** sends the Apple wake command. This is only enabled
+  when the selected drive is the Apple SuperDrive USB ID `05ac:1500`.
+- **Eject** unmounts mounted media first, then ejects the disc.
+- **Prevent Eject** sets SCSI Prevent/Allow Medium Removal so the door can't
+  pop open during a burn. **Allow Eject** clears it.
+- **Keep Port Powered** disables USB autosuspend on the parent port via sysfs.
+  Requires sudo and resets on unplug; add a udev rule if you want it permanent.
+
+While a command runs, the UI blocks overlapping actions and shows a modal
+"Working" dialog.
+
+## CLI
+
+Read-only commands can run directly:
+
+```bash
+superdrive-cli device list
+superdrive-cli device status --device /dev/sr0
+superdrive-cli device probe  --device /dev/sr0
+```
+
+Commands that change hardware state require either `--yes` or `--dry-run`.
+This prevents scripts from changing drive state by accident:
+
+```bash
+superdrive-cli device load  --yes --device /dev/sr0
+superdrive-cli device eject --yes --device /dev/sr0
+superdrive-cli device lock  --yes --prevent --device /dev/sr0
+superdrive-cli device lock  --yes --allow   --device /dev/sr0
+```
+
+Add `--json` for a structured stdout payload. Failures go to stderr as
+`{"error": {"message": ..., "hint": ..., "details": {...}}}`. Exit codes are
+stable:
+
+| code | meaning           |
+|------|-------------------|
+| 0    | success           |
+| 1    | operation failed  |
+| 2    | bad input/config  |
+| 3    | device not found  |
+
+`superdrive-cli schema describe --json` dumps the full command contract for
+scripting.
+
+## udev rule (optional)
+
+The GUI and CLI let you wake the drive manually. If you want the drive to be
+woken automatically when it is plugged in, install the included udev rule:
+
+```bash
+sudo cp udev/99-apple-superdrive.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+```
+
+Replug the drive after installing the rule. The rule sends the Apple wake
+command and disables autosuspend for that port.
 
 ## Development
 
+For local work:
+
 ```bash
+pip install -e ".[dev]"
 ruff check .
 pytest -q
-python3 -m py_compile $(find . -name '*.py' -not -path './.venv/*')
 ```
-
----
-
-## Packaging a single binary
-
-```bash
-python3 -m pip install --user pyinstaller
-pyinstaller --onefile --windowed --name SuperDriveHelper \
-  superdrive/gui/main_window.py
-# binary in dist/
-```
-
----
-
-## Notes
-
-- The Apple CDB path is gated to USB ID `05ac:1500` — it will not be sent to
-  other drives, even by mistake.
-- USB autosuspend toggling is **temporary**: it does not persist across
-  unplug or reboot. For a permanent fix, add a udev rule.
-- The GUI uses a compact dark Qt stylesheet in `superdrive/gui/theme/style.qss`.

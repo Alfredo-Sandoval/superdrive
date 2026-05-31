@@ -357,6 +357,81 @@ def test_cli_missing_device_uses_not_found_exit(monkeypatch):
     assert payload["error"]["message"] == "No optical drives found."
 
 
+def test_cli_requires_explicit_device_when_multiple_drives(monkeypatch):
+    cli_app = importlib.import_module("superdrive.cli")
+    controller = FakeCliController()
+    controller.devices = [controller.apple, controller.other]
+    runner = CliRunner()
+    monkeypatch.setattr(cli_app, "build_controller", lambda: controller)
+
+    result = runner.invoke(cli_app.app, ["device", "status", "--json"])
+    payload = json.loads(result.stderr)
+
+    assert result.exit_code == cli_app.EXIT_CONFIG
+    assert result.stdout == ""
+    assert payload["error"]["message"] == "Multiple optical drives found."
+    assert "--device /dev/srX" in payload["error"]["hint"]
+    assert controller.tur_calls == []
+
+
+def test_cli_explicit_device_selects_matching_drive(monkeypatch):
+    cli_app = importlib.import_module("superdrive.cli")
+    controller = FakeCliController()
+    controller.devices = [controller.apple, controller.other]
+    runner = CliRunner()
+    monkeypatch.setattr(cli_app, "build_controller", lambda: controller)
+
+    result = runner.invoke(
+        cli_app.app,
+        ["device", "status", "--device", "/dev/sr-test1", "--json"],
+    )
+    payload = json.loads(result.stdout)
+
+    assert result.exit_code == 0
+    assert result.stderr == ""
+    assert payload["device"]["sr_path"] == "/dev/sr-test1"
+    assert payload["device"]["is_apple_superdrive"] is False
+    assert controller.tur_calls == [Path("/dev/sr-test1")]
+
+
+def test_cli_rejects_load_for_non_apple_drive(monkeypatch):
+    cli_app = importlib.import_module("superdrive.cli")
+    controller = FakeCliController()
+    controller.devices = [controller.other]
+    runner = CliRunner()
+    monkeypatch.setattr(cli_app, "build_controller", lambda: controller)
+
+    result = runner.invoke(cli_app.app, ["device", "load", "--yes", "--json"])
+    payload = json.loads(result.stderr)
+
+    assert result.exit_code == cli_app.EXIT_CONFIG
+    assert result.stdout == ""
+    assert payload["error"]["message"] == (
+        "Load is only supported for Apple SuperDrive USB ID 05ac:1500."
+    )
+    assert controller.load_calls == []
+
+
+def test_cli_eject_skips_hardware_when_unmount_fails(monkeypatch):
+    cli_app = importlib.import_module("superdrive.cli")
+    controller = FakeCliController()
+    controller.unmount_result = (False, "udisksctl rc=1\nbusy")
+    runner = CliRunner()
+    monkeypatch.setattr(cli_app, "build_controller", lambda: controller)
+
+    result = runner.invoke(cli_app.app, ["device", "eject", "--yes", "--json"])
+    payload = json.loads(result.stderr)
+
+    assert result.exit_code == cli_app.EXIT_GENERIC
+    assert result.stdout == ""
+    assert payload["error"]["message"] == "Unmount failed; eject was skipped."
+    assert payload["error"]["details"] == {
+        "ejected": False,
+        "unmount": "udisksctl rc=1 busy",
+    }
+    assert controller.eject_calls == []
+
+
 def test_cli_import_does_not_load_qt_runtime():
     code = (
         "import sys;"
@@ -504,6 +579,28 @@ def test_canonical_backend_run_returns_timeout_rc(monkeypatch):
     assert isinstance(err, str)
 
 
+def test_backend_vendor_load_sends_exact_apple_cdb(monkeypatch):
+    commands = importlib.import_module("superdrive.commands")
+    calls = []
+
+    def fake_run(cmd, use_shell=False, timeout=commands.COMMAND_TIMEOUT_SECONDS):
+        calls.append((cmd, use_shell, timeout))
+        return 0, "ok", ""
+
+    monkeypatch.setattr(commands, "run", fake_run)
+
+    rc, out, err = commands.send_vendor_load(Path("/dev/sr0"))
+
+    assert (rc, out, err) == (0, "ok", "")
+    assert calls == [
+        (
+            ["sg_raw", "/dev/sr0", "EA", "00", "00", "00", "00", "00", "01"],
+            False,
+            commands.COMMAND_TIMEOUT_SECONDS,
+        )
+    ]
+
+
 def test_backend_rejects_shell_and_unsafe_absolute_commands():
     commands = importlib.import_module("superdrive.commands")
 
@@ -537,6 +634,27 @@ def test_drive_controller_uses_injected_service_without_discovery():
     assert controller.discover_devices() == [device]
     assert controller.require_sg3() == (True, "")
     assert controller.validate_device(device) == (True, "")
+
+
+def test_drive_service_power_keep_on_writes_expected_sysfs_values(tmp_path):
+    service_module = importlib.import_module("superdrive.drive")
+    usb_path = tmp_path / "usb-device"
+    power_path = usb_path / "power"
+    power_path.mkdir(parents=True)
+    control = power_path / "control"
+    delay = power_path / "autosuspend_delay_ms"
+    control.write_text("auto")
+    delay.write_text("2000")
+
+    service = service_module.DriveService()
+    results = service.power_keep_on(usb_path)
+
+    assert results == [
+        (str(control), True, "set to on"),
+        (str(delay), True, "set to -1"),
+    ]
+    assert control.read_text() == "on"
+    assert delay.read_text() == "-1"
 
 
 def test_drive_service_can_discover_and_revalidate_fake_sysfs(tmp_path):

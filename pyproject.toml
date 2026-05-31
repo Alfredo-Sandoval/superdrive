@@ -5,9 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "superdrive-helper"
 version = "0.1.0"
-description = "A PySide6 helper for Apple USB SuperDrive devices on Linux."
+description = "Linux support for the Apple USB SuperDrive."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Alfredo Sandoval" }]
 dependencies = ["PySide6>=6.5", "typer>=0.12"]
 
 [project.optional-dependencies]
