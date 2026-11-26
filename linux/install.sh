@@ -2,6 +2,7 @@
 # Installs or removes the Apple SuperDrive helper for Linux:
 #   - superdrive.py, the wake/eject/status helper, in /usr/local/lib/apple-superdrive-helper
 #   - a udev rule (and a systemd unit on systemd systems) that wakes the drive on every plug-in
+#     and keeps USB autosuspend off for it
 #   - a polkit policy that lets the desktop user wake the drive from the window without a password
 #   - the Qt window, an apple-superdrive-helper launcher and a desktop entry
 #
@@ -24,7 +25,7 @@ system_python=/usr/bin/python3
 source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 usage() {
-    sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 use_venv=false
@@ -68,10 +69,12 @@ install_helper() {
     install -m 0755 "$source_dir/superdrive.py" "$helper"
 }
 
-# 05ac:1500 is the USB ID of the Apple USB SuperDrive (check yours with lsusb). The rule
-# matches its optical block device; the helper checks the SCSI inquiry strings again.
+# 05ac:1500 is the USB ID of the Apple USB SuperDrive (check yours with lsusb). The wake
+# rule matches its optical block device; the helper checks the SCSI inquiry strings again.
 install_auto_wake() {
+    local keep_powered='ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="1500", ATTR{power/control}="on"'
     local match='ACTION=="add", SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="1500"'
+    local wake_action
     if has_systemd; then
         # udev kills long-running RUN programs and sandboxes them, so it starts a unit instead.
         cat >"$unit_file" <<EOF
@@ -85,17 +88,18 @@ Type=oneshot
 ExecStart=$helper wake --device /dev/%I --source udev
 EOF
         chmod 0644 "$unit_file"
-        cat >"$rule_file" <<EOF
-# Wakes the Apple USB SuperDrive each time it is plugged in, so it accepts discs.
-$match, TAG+="systemd", ENV{SYSTEMD_WANTS}+="apple-superdrive-wake@%k.service"
-EOF
         systemctl daemon-reload
+        wake_action='TAG+="systemd", ENV{SYSTEMD_WANTS}+="apple-superdrive-wake@%k.service"'
     else
-        cat >"$rule_file" <<EOF
-# Wakes the Apple USB SuperDrive each time it is plugged in, so it accepts discs.
-$match, RUN+="$helper wake --device /dev/%k --source udev"
-EOF
+        wake_action="RUN+=\"$helper wake --device /dev/%k --source udev\""
     fi
+    cat >"$rule_file" <<EOF
+# Apple USB SuperDrive (05ac:1500)
+# Keeps USB autosuspend off for the drive, which can otherwise drop it off the bus.
+$keep_powered
+# Wakes the drive each time it is plugged in, so it accepts discs.
+$match, $wake_action
+EOF
     chmod 0644 "$rule_file"
     udevadm control --reload-rules
 }

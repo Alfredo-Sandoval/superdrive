@@ -840,8 +840,13 @@ class MainWindow(QWidget):
         if kind == "wake" and exit_code == 127:
             return "Authorization failed, so the drive was not woken."
         lines = [line.strip() for line in errors.splitlines() if line.strip()]
+        # The helper prints "error: <message>" and then, when it has one, "hint: <next step>".
+        messages = [line.removeprefix("error: ") for line in lines if line.startswith("error: ")]
+        hints = [line.removeprefix("hint: ") for line in lines if line.startswith("hint: ")]
+        if messages:
+            return f"{messages[-1]} {hints[-1]}" if hints else messages[-1]
         if lines:
-            return lines[-1].removeprefix("error: ")
+            return lines[-1]
         if exit_code == -1:
             return f"The {kind} command stopped unexpectedly."
         return f"The {kind} command exited with code {exit_code}."

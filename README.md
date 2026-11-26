@@ -12,7 +12,7 @@ On Windows and Linux the SuperDrive shows up as an ordinary optical drive, but i
 | Platform | Use |
 | --- | --- |
 | Windows | `AppleSuperDriveGui.cmd` (window) or `Enable-AppleSuperDrive.cmd` (command line) |
-| Linux | the `superdrive-helper` Python package, or the standalone installer in `linux/` |
+| Linux | `linux/install.sh`, which sets up automatic wake, a window, and a command-line helper |
 
 ## Windows
 
@@ -43,96 +43,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Enable-AppleSuperDrive
 
 ## Linux
 
-There are two Linux versions. Both wake the drive; they differ in how they install and what else they do.
+The Linux version wakes the drive automatically each time it is plugged in, whether or not the window is open. It has not been tested with a real drive yet.
 
-- **`superdrive-helper` package** (`superdrive/`): a GUI and a CLI installed with pip. It talks to the drive through sg3-utils and can also lock the drive during a burn and keep its USB port powered. Automatic wake on plug-in is an optional udev rule.
-- **Standalone installer** (`linux/`): one script that sets up automatic wake on plug-in, a Wake button that needs no password, and a window that matches the Windows version. The helper uses only the Python standard library. It has not been tested with a real drive yet.
-
-Both install a udev rule at `/etc/udev/rules.d/99-apple-superdrive.rules`, so install one or the other.
-
-To wake the drive once by hand with sg3-utils:
-
-```bash
-sudo sg_raw /dev/sr0 EA 00 00 00 00 00 01
-```
-
-### superdrive-helper package
-
-Install from the repository root:
-
-```bash
-sudo apt install sg3-utils
-python -m pip install .
-```
-
-Or with conda:
-
-```bash
-conda env create -f environment.yml
-conda activate superdrive
-sudo apt install sg3-utils   # not on conda-forge
-python -m pip install .
-```
-
-Most Linux systems require your user to be in the `cdrom` group to access `/dev/sr0` directly:
-
-```bash
-sudo usermod -aG cdrom "$USER"
-newgrp cdrom
-```
-
-#### GUI
-
-<img alt="The superdrive-helper window on Linux" src="docs/screenshot.png" width="320">
-
-Run `superdrive-helper`. The buttons are:
-
-- **Load** sends the wake command. It is enabled only for a drive with USB ID `05ac:1500`.
-- **Eject** unmounts the disc if it is mounted, then ejects it.
-- **Lock** and **Unlock** set and clear SCSI Prevent/Allow Medium Removal, so the disc cannot be ejected during a burn.
-- **Status** checks whether the drive is ready. **Probe** shows its INQUIRY, VPD, and mode data.
-- **Power** disables USB autosuspend for the drive's port. It needs root and resets when the drive is unplugged.
-
-#### CLI
-
-Read-only commands run directly:
-
-```bash
-superdrive-cli device list
-superdrive-cli device status --device /dev/sr0
-superdrive-cli device probe  --device /dev/sr0
-```
-
-Commands that change the drive's state require `--yes` or `--dry-run`, so a script cannot change it by accident:
-
-```bash
-superdrive-cli device load  --yes --device /dev/sr0
-superdrive-cli device eject --yes --device /dev/sr0
-superdrive-cli device lock  --yes --prevent --device /dev/sr0
-superdrive-cli device lock  --yes --allow   --device /dev/sr0
-```
-
-Add `--json` for structured output on stdout. Errors go to stderr as `{"error": {"message": ..., "hint": ..., "details": {...}}}`. `superdrive-cli schema describe --json` prints the full command contract.
-
-| Exit code | Meaning |
-| --- | --- |
-| 0 | Success |
-| 1 | Operation failed |
-| 2 | Bad input or configuration |
-| 3 | Device not found |
-
-#### Automatic wake
-
-To wake the drive whenever it is plugged in, install the udev rule and replug the drive:
-
-```bash
-sudo cp udev/99-apple-superdrive.rules /etc/udev/rules.d/
-sudo udevadm control --reload
-```
-
-The rule sends the wake command with `sg_raw` and disables USB autosuspend for the drive.
-
-### Standalone installer
+### Install
 
 ```bash
 sudo bash linux/install.sh
@@ -141,7 +54,7 @@ sudo bash linux/install.sh
 This installs:
 
 - `/usr/local/lib/apple-superdrive-helper/superdrive.py`, the command-line helper (Python 3 standard library only)
-- `/etc/udev/rules.d/99-apple-superdrive.rules`, which matches the SuperDrive's USB ID `05ac:1500` and, on systemd systems, starts `apple-superdrive-wake@.service` to wake it
+- `/etc/udev/rules.d/99-apple-superdrive.rules`, which matches the SuperDrive's USB ID `05ac:1500`, keeps USB autosuspend off for it, and wakes it on plug-in. On systemd systems the wake runs as `apple-superdrive-wake@.service`.
 - a polkit policy that lets the logged-in user wake the drive from the window without a password
 - the window, an `apple-superdrive-helper` launcher, and a "SuperDrive Helper" menu entry
 
@@ -153,56 +66,60 @@ The window needs PySide6. Install it from your distribution (`python3-pyside6.qt
 | `--no-gui` | Install only the automatic wake and the command-line helper |
 | `--uninstall` | Remove everything the installer added |
 
+### Window
+
 Plug in the drive. It is woken within a second or two. To see the result:
 
 ```bash
 journalctl -u 'apple-superdrive-wake@*'
 ```
 
-Open SuperDrive Helper from the applications menu, or run `apple-superdrive-helper`. The window follows the desktop's light or dark theme and logs to `~/.local/state/apple-superdrive-helper/gui.log`.
+Open SuperDrive Helper from the applications menu, or run `apple-superdrive-helper`. The window works like the Windows one. It shows the drive's state with the next step as the main button (wake the drive or open the disc), plus Wake, Eject, Refresh, and Copy diagnostics. It follows the desktop's light or dark theme and logs to `~/.local/state/apple-superdrive-helper/gui.log`.
 
-From a terminal:
+### Command line
 
 ```bash
 helper=/usr/local/lib/apple-superdrive-helper/superdrive.py
-$helper status            # add --json for machine-readable output
+$helper status            # connected SuperDrives, their discs, and the last wake
 sudo $helper wake
-$helper eject
+$helper eject             # unmounts the disc first
 $helper open              # mounts the disc if needed and opens it in the file manager
-$helper wake --device /dev/sr1
+$helper lock              # refuse eject requests, for example during a burn
+$helper unlock
+$helper probe             # INQUIRY, VPD, and mode pages; needs sg3-utils
 ```
 
-Without `--device`, `wake` and `eject` act on every connected SuperDrive and `open` uses the first one.
+Add `--device /dev/sr1` to pick a drive. Without it, `wake`, `eject`, `lock`, and `unlock` act on every connected SuperDrive, and `open` and `probe` use the first one. `wake`, `eject`, `lock`, and `unlock` also accept `--dry-run`, which lists the drives they would act on and stops.
 
-Waking needs root because Linux only passes vendor-specific SCSI commands from processes with `CAP_SYS_RAWIO`. When started through pkexec, the helper accepts only `wake`, and only for a device whose SCSI inquiry identifies it as an Apple SuperDrive.
+Every command accepts `--json`. The result goes to stdout as one JSON object, and errors go to stderr as `{"error": {"message": ..., "hint": ..., "details": {...}}}`.
 
-To run the window from a checkout without installing, use `python3 linux/superdrive_gui.py`. Without the polkit policy, waking the drive asks for your password.
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | The operation failed |
+| 2 | Bad arguments |
+| 3 | No matching SuperDrive is connected |
+
+Waking needs root because Linux only passes vendor-specific SCSI commands from processes with `CAP_SYS_RAWIO`. When started through pkexec, the helper accepts only `wake`, and only for a device whose SCSI inquiry identifies it as an Apple SuperDrive. Unlocking a drive whose disc is mounted also needs root.
+
+### Without installing
+
+From a checkout, `sudo python3 linux/superdrive.py wake` wakes the drive once, and `python3 linux/superdrive_gui.py` opens the window. Without the polkit policy, the window asks for your password to wake the drive.
 
 ## Troubleshooting
 
 - Plug the drive directly into a USB port on the computer, without a hub or adapter, when you can.
 - If the wake is rejected, try another USB port or cable, then wake the drive again.
+- If eject fails, check that the drive is not locked (`unlock`) and that no program is using the disc.
 - If the drive accepts the wake but still refuses discs, the remaining causes are power, the cable or adapter, or a mechanical fault.
 
-## Development
-
-The `superdrive-helper` package:
-
-```bash
-pip install -e ".[dev]"
-ruff check .
-pytest -q
-```
-
-The standalone Linux helper:
+## Tests
 
 ```bash
 python3 -m unittest discover -s linux/tests
 ```
 
-These tests cover the code that does not need a drive: the `sg_io_hdr` layout, sense decoding, drive discovery on a fake sysfs tree, mount and udev parsing, wake records, and what the window shows in each state. The window tests are skipped when PySide6 is not installed.
-
-The Windows scripts have no automated tests.
+The tests cover the Linux code that does not need a drive: the `sg_io_hdr` layout, sense decoding, drive discovery on a fake sysfs tree, mount and udev parsing, wake records, the command-line contract (JSON output, exit codes, dry runs, lock, and probe), and what the window shows in each state. The window tests are skipped when PySide6 is not installed. The Windows scripts have no automated tests.
 
 ## License
 
