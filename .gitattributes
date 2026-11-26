@@ -1,0 +1,4 @@
+# Linux scripts must keep LF endings even when checked out on Windows; cmd launchers want CRLF.
+*.sh text eol=lf
+*.py text eol=lf
+*.cmd text eol=crlf
