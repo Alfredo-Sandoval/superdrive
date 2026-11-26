@@ -8,3 +8,7 @@ Desktop.ini
 # Editors
 .vscode/
 .idea/
+
+# Python
+__pycache__/
+*.pyc
