@@ -43,7 +43,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Enable-AppleSuperDrive
 
 ## Linux
 
-The Linux version wakes the drive automatically each time it is plugged in, whether or not the window is open. It has not been tested with a real drive yet.
+The Linux version wakes the drive automatically each time it is plugged in, whether or not the window is open.
 
 ### Install
 
@@ -68,7 +68,7 @@ The window needs PySide6. Install it from your distribution (`python3-pyside6.qt
 
 ### Window
 
-Plug in the drive. It is woken within a second or two. To see the result:
+Plug in the drive and it is woken automatically. To see the result:
 
 ```bash
 journalctl -u 'apple-superdrive-wake@*'
@@ -108,7 +108,7 @@ From a checkout, `sudo python3 linux/superdrive.py wake` wakes the drive once, a
 
 ## Troubleshooting
 
-- Plug the drive directly into a USB port on the computer, without a hub or adapter, when you can.
+- Plug the drive directly into a USB port on the computer, without a hub or adapter.
 - If the wake is rejected, try another USB port or cable, then wake the drive again.
 - If eject fails, check that the drive is not locked (`unlock`) and that no program is using the disc.
 - If the drive accepts the wake but still refuses discs, the remaining causes are power, the cable or adapter, or a mechanical fault.
@@ -119,7 +119,7 @@ From a checkout, `sudo python3 linux/superdrive.py wake` wakes the drive once, a
 python3 -m unittest discover -s linux/tests
 ```
 
-The tests cover the Linux code that does not need a drive: the `sg_io_hdr` layout, sense decoding, drive discovery on a fake sysfs tree, mount and udev parsing, wake records, the command-line contract (JSON output, exit codes, dry runs, lock, and probe), and what the window shows in each state. The window tests are skipped when PySide6 is not installed. The Windows scripts have no automated tests.
+The tests cover the Linux code that does not need a drive: the `sg_io_hdr` layout, sense decoding, drive discovery on a fake sysfs tree, mount and udev parsing, wake records, the command-line contract (JSON output, exit codes, dry runs, lock, and probe), and what the window shows in each state. The window tests are skipped when PySide6 is not installed.
 
 ## License
 
