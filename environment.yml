@@ -1,0 +1,13 @@
+name: superdrive
+channels:
+  - conda-forge
+dependencies:
+  - python >=3.10,<3.13
+  - pyside6
+  - pytest
+  - ruff
+  - typer
+  - pip
+  # Optional: build standalone binary
+  # - pyinstaller
+  # Note: sg3_utils must be installed via your system package manager (e.g. apt).

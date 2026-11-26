@@ -1,0 +1,13 @@
+# Apple USB SuperDrive (05ac:1500) — wake on plug, keep port powered.
+#
+# Install:
+#   sudo cp udev/99-apple-superdrive.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+#
+# Requires sg3-utils (sg_raw).
+
+# Disable USB autosuspend on the drive so it doesn't drop off the bus.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="1500", ATTR{power/autosuspend}="-1", ATTR{power/control}="on"
+
+# Send the Apple wake CDB when the sr block device appears.
+ACTION=="add", KERNEL=="sr[0-9]*", SUBSYSTEM=="block", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="1500", RUN+="/usr/bin/sg_raw /dev/%k EA 00 00 00 00 00 01"
