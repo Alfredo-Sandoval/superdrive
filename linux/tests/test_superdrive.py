@@ -4,10 +4,11 @@ import ctypes
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -141,17 +142,114 @@ class WakeRecordTests(unittest.TestCase):
         self.assertIsNone(superdrive.read_wake_record(self.drive, self.state_dir))
 
 
+SUPERDRIVE = superdrive.Drive("sr0", "/dev/sr0", "Apple", "SuperDrive", "2.03", plug_id="1-14")
+
+
+def run_main(argv, drives=(SUPERDRIVE,)):
+    """Runs the command line against fake drives and returns (exit code, stdout, stderr)."""
+    with mock.patch.object(superdrive, "find_superdrives", return_value=list(drives)), \
+            redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+        code = superdrive.main(argv)
+    return code, output.getvalue(), errors.getvalue()
+
+
 class CommandLineTests(unittest.TestCase):
     def test_pkexec_only_allows_wake(self):
-        with mock.patch.dict(os.environ, {"PKEXEC_UID": "1000"}), redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(superdrive.main(["status"]), 2)
-        self.assertIn("only runs 'wake'", errors.getvalue())
+        with mock.patch.dict(os.environ, {"PKEXEC_UID": "1000"}):
+            code, _, errors = run_main(["status"])
+        self.assertEqual(code, 2)
+        self.assertIn("only runs 'wake'", errors)
 
     def test_status_json_with_no_drives(self):
         with tempfile.TemporaryDirectory() as temp:
             status = superdrive.collect_status(Path(temp), Path(temp) / "state")
         self.assertEqual(status["drives"], [])
         json.dumps(status)  # the window parses this output
+
+    def test_exit_codes_tell_missing_drives_from_bad_input(self):
+        self.assertEqual(run_main(["wake", "--dry-run"], drives=())[0], superdrive.EXIT_NOT_FOUND)
+        self.assertEqual(run_main(["wake", "--dry-run", "--device", "/dev/sr1"])[0], superdrive.EXIT_NOT_FOUND)
+        self.assertEqual(run_main(["wake", "--dry-run", "--device", "/dev/sda"])[0], superdrive.EXIT_USAGE)
+        self.assertEqual(run_main(["wake", "--no-such-option"])[0], superdrive.EXIT_USAGE)
+
+    def test_errors_print_the_message_then_the_hint(self):
+        code, output, errors = run_main(["wake", "--dry-run"], drives=())
+        self.assertEqual(output, "")
+        self.assertEqual(errors.splitlines(), [
+            "error: No Apple SuperDrive is connected.",
+            "hint: Plug the drive straight into a USB port on this computer.",
+        ])
+
+    def test_json_errors_go_to_stderr_as_one_object(self):
+        for argv in (["wake", "--dry-run", "--json"], ["status", "--json", "--no-such-option"]):
+            with self.subTest(argv=argv):
+                code, output, errors = run_main(argv, drives=())
+                self.assertEqual(output, "")
+                error = json.loads(errors)["error"]
+                self.assertTrue(error["message"])
+                self.assertTrue(error["hint"])
+                self.assertEqual(error["details"], {})
+
+    def test_dry_run_names_the_drives_without_touching_them(self):
+        with mock.patch.object(superdrive, "send_wake") as send_wake, \
+                mock.patch.object(superdrive, "set_door_lock") as set_door_lock:
+            for action in ("wake", "lock", "unlock"):
+                with self.subTest(action=action):
+                    code, output, _ = run_main([action, "--dry-run", "--json"])
+                    self.assertEqual(code, 0)
+                    self.assertEqual(json.loads(output),
+                                     {"dry_run": True, "action": action, "devices": ["/dev/sr0"]})
+            self.assertEqual(run_main(["wake", "--dry-run"])[1], "Would wake /dev/sr0.\n")
+        send_wake.assert_not_called()
+        set_door_lock.assert_not_called()
+
+
+class DoorLockTests(unittest.TestCase):
+    def test_lock_and_unlock_use_the_cdrom_lockdoor_ioctl(self):
+        fake_fcntl = mock.Mock()
+        # O_NONBLOCK only exists on POSIX; its value does not matter with os.open mocked.
+        with mock.patch.dict(sys.modules, {"fcntl": fake_fcntl}), \
+                mock.patch.object(superdrive.os, "O_NONBLOCK", 0o4000, create=True), \
+                mock.patch.object(superdrive.os, "open", return_value=7) as open_device, \
+                mock.patch.object(superdrive.os, "close") as close_device:
+            self.assertEqual(run_main(["lock"])[0], 0)
+            self.assertEqual(run_main(["unlock", "--json"])[0:2], (0, '{"locked": false, "devices": ["/dev/sr0"]}\n'))
+        self.assertEqual(open_device.call_args.args[0], "/dev/sr0")
+        self.assertEqual(fake_fcntl.ioctl.call_args_list,
+                         [mock.call(7, 0x5329, 1), mock.call(7, 0x5329, 0)])
+        self.assertEqual(close_device.call_count, 2)
+
+    def test_busy_drive_gets_a_hint(self):
+        busy = OSError(16, "Device or resource busy")  # EBUSY
+        with mock.patch.object(superdrive, "set_door_lock", side_effect=busy):
+            code, _, errors = run_main(["unlock"])
+        self.assertEqual(code, superdrive.EXIT_FAILED)
+        self.assertIn("error: Could not unlock /dev/sr0: Device or resource busy", errors)
+        self.assertIn("hint: The disc is mounted or another program has the drive open.", errors)
+
+
+class ProbeTests(unittest.TestCase):
+    def test_without_sg3_utils_it_says_how_to_install_them(self):
+        with mock.patch.object(superdrive.shutil, "which", return_value=None):
+            code, _, errors = run_main(["probe"])
+        self.assertEqual(code, superdrive.EXIT_FAILED)
+        self.assertIn("sg3-utils", errors)
+
+    def test_runs_each_installed_tool_on_the_first_drive(self):
+        def which(name):
+            return None if name == "sg_modes" else f"/usr/bin/{name}"
+
+        completed = subprocess.CompletedProcess([], 0, stdout="APPLE SuperDrive\n", stderr="")
+        with mock.patch.object(superdrive.shutil, "which", side_effect=which), \
+                mock.patch.object(superdrive.subprocess, "run", return_value=completed) as run:
+            code, output, _ = run_main(["probe", "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual([call.args[0] for call in run.call_args_list],
+                         [["/usr/bin/sg_inq", "/dev/sr0"], ["/usr/bin/sg_vpd", "-a", "/dev/sr0"]])
+        payload = json.loads(output)
+        self.assertEqual([result["command"] for result in payload["results"]],
+                         ["sg_inq /dev/sr0", "sg_vpd -a /dev/sr0"])
+        self.assertEqual(payload["results"][0]["stdout"], "APPLE SuperDrive\n")
 
 
 if __name__ == "__main__":

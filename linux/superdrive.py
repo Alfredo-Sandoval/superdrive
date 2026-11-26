@@ -5,10 +5,14 @@ The SuperDrive ignores discs until it receives the vendor-specific command
 EA 00 00 00 00 00 01. ``wake`` sends it through the SG_IO ioctl. The kernel only
 passes vendor commands for processes with CAP_SYS_RAWIO, so ``wake`` runs as root:
 from the udev rule on every plug-in, or through pkexec from the window.
-``status``, ``eject`` and ``open`` run as the desktop user.
+The other commands run as the desktop user.
 
 This one file backs the udev rule, the command line and the window, and uses only
 the Python standard library so it can run as root without a virtual environment.
+
+Every command accepts ``--json``: results go to stdout as one JSON object, and
+errors go to stderr as {"error": {"message", "hint", "details"}}. Exit codes are
+0 success, 1 operation failed, 2 bad input, 3 no matching drive.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import datetime
+import errno
 import json
 import os
 import re
@@ -41,6 +46,17 @@ WAKE_TIMEOUT_MS = 10_000
 # Retrying clears it; any other failure is reported unchanged.
 MAX_WAKE_ATTEMPTS = 3
 SENSE_KEY_UNIT_ATTENTION = 0x06
+# The cdrom driver keeps a door locked with this ioctl after the process exits, and
+# refuses eject requests until it is unlocked. It needs no root.
+CDROM_LOCKDOOR = 0x5329
+
+# sg3-utils tools that ``probe`` runs when they are installed.
+PROBE_COMMANDS = (("sg_inq",), ("sg_vpd", "-a"), ("sg_modes", "-a"))
+PROBE_TIMEOUT_SECONDS = 45
+
+EXIT_FAILED = 1
+EXIT_USAGE = 2
+EXIT_NOT_FOUND = 3
 
 DEVICE_PATTERN = re.compile(r"/dev/sr[0-9]+")
 
@@ -60,7 +76,22 @@ SENSE_KEY_NAMES = (
 
 
 class HelperError(Exception):
-    """A failure reported to the user as one message, without a traceback."""
+    """A failure reported to the user as one message and an optional hint, without a traceback."""
+
+    def __init__(self, message: str, hint: str = "", exit_code: int = EXIT_FAILED,
+                 details: dict | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.hint = hint
+        self.exit_code = exit_code
+        self.details = details or {}
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    """Reports bad arguments as a HelperError, so --json covers them too."""
+
+    def error(self, message: str):
+        raise HelperError(message, hint=f"Run '{self.prog} --help' for usage.", exit_code=EXIT_USAGE)
 
 
 class SgIoHeader(ctypes.Structure):
@@ -189,14 +220,19 @@ def select_drives(device: str | None, sysfs_root: Path = SYSFS_ROOT) -> list[Dri
     drives = find_superdrives(sysfs_root)
     if device is None:
         if not drives:
-            raise HelperError("No Apple SuperDrive is connected.")
+            raise HelperError("No Apple SuperDrive is connected.",
+                              hint="Plug the drive straight into a USB port on this computer.",
+                              exit_code=EXIT_NOT_FOUND)
         return drives
 
     if not DEVICE_PATTERN.fullmatch(device):
-        raise HelperError(f"{device} is not an optical drive device such as /dev/sr0.")
+        raise HelperError(f"{device} is not an optical drive device.",
+                          hint="Pass a device such as /dev/sr0.", exit_code=EXIT_USAGE)
     matching = [drive for drive in drives if drive.device == device]
     if not matching:
-        raise HelperError(f"{device} is not a connected Apple SuperDrive.")
+        raise HelperError(f"{device} is not a connected Apple SuperDrive.",
+                          hint="Run the status command to list connected SuperDrives.",
+                          exit_code=EXIT_NOT_FOUND)
     return matching
 
 
@@ -357,6 +393,19 @@ def read_wake_record(drive: Drive, state_dir: Path = STATE_DIR) -> dict | None:
     return record
 
 
+# --- Door lock ----------------------------------------------------------------------------
+
+def set_door_lock(device: str, locked: bool) -> None:
+    """Locks or unlocks the drive so eject requests are refused or allowed again."""
+    import fcntl  # Linux only, as in send_wake.
+
+    descriptor = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        fcntl.ioctl(descriptor, CDROM_LOCKDOOR, 1 if locked else 0)
+    finally:
+        os.close(descriptor)
+
+
 # --- Commands -----------------------------------------------------------------------------
 
 def collect_status(sysfs_root: Path = SYSFS_ROOT, state_dir: Path = STATE_DIR) -> dict:
@@ -397,11 +446,14 @@ def command_status(args: argparse.Namespace) -> int:
 
 
 def command_wake(args: argparse.Namespace) -> int:
+    drives = select_drives(args.device)
+    if args.dry_run:
+        return report_dry_run(args, "wake", drives)
     if os.geteuid() != 0:
-        raise HelperError(f"Waking the drive needs root. Run: sudo {Path(__file__).resolve()} wake")
+        raise HelperError("Waking the drive needs root.", hint=f"Run: sudo {Path(__file__).resolve()} wake")
 
-    all_woke = True
-    for drive in select_drives(args.device):
+    results = []
+    for drive in drives:
         try:
             result = send_wake(drive.device)
         except OSError as error:
@@ -411,31 +463,117 @@ def command_wake(args: argparse.Namespace) -> int:
             ok = result.succeeded
             detail = result.describe()
 
-        all_woke = all_woke and ok
-        verb = "woke" if ok else "did not wake"
-        print(f"{drive.device} {verb}: {detail}", file=sys.stdout if ok else sys.stderr)
+        entry = {"device": drive.device, "ok": ok, "detail": detail, "recorded": True}
+        if not args.json:
+            verb = "woke" if ok else "did not wake"
+            print(f"{drive.device} {verb}: {detail}", file=sys.stdout if ok else sys.stderr)
 
         try:
             write_wake_record(drive, ok, detail, args.source)
         except OSError as error:
             # The wake itself is done; only the window's status line will be missing it.
-            print(f"warning: could not record the wake outcome: {error}", file=sys.stderr)
+            entry["recorded"] = False
+            if not args.json:
+                print(f"warning: could not record the wake outcome: {error}", file=sys.stderr)
+        results.append(entry)
 
-    return 0 if all_woke else 1
+    failed = [entry for entry in results if not entry["ok"]]
+    if not failed:
+        if args.json:
+            print(json.dumps({"results": results}))
+        return 0
+    if args.json:
+        message = (f"{failed[0]['device']} did not wake: {failed[0]['detail']}" if len(failed) == 1
+                   else f"{len(failed)} SuperDrives did not wake.")
+        raise HelperError(message, hint="Try another USB port or cable, then wake the drive again.",
+                          details={"results": results})
+    return EXIT_FAILED
 
 
 def command_eject(args: argparse.Namespace) -> int:
     eject_tool = shutil.which("eject")
     if eject_tool is None:
-        raise HelperError("The eject command is not installed; it comes with util-linux.")
+        raise HelperError("The eject command is not installed.", hint="Install util-linux from your distribution.")
 
-    for drive in select_drives(args.device):
+    drives = select_drives(args.device)
+    if args.dry_run:
+        return report_dry_run(args, "eject", drives)
+
+    ejected = []
+    for drive in drives:
         # eject unmounts the disc before opening the slot.
         completed = subprocess.run([eject_tool, drive.device], capture_output=True, text=True, timeout=60, check=False)
         if completed.returncode != 0:
             reason = completed.stderr.strip() or f"eject exited with code {completed.returncode}"
-            raise HelperError(f"Could not eject {drive.device}: {reason}")
-        print(f"Ejected {drive.device}.")
+            raise HelperError(f"Could not eject {drive.device}: {reason}",
+                              hint="Close programs using the disc. If the drive is locked, run unlock first.",
+                              details={"ejected": ejected})
+        ejected.append(drive.device)
+        if not args.json:
+            print(f"Ejected {drive.device}.")
+    if args.json:
+        print(json.dumps({"ejected": ejected}))
+    return 0
+
+
+def command_lock(args: argparse.Namespace) -> int:
+    action = "lock" if args.locked else "unlock"
+    drives = select_drives(args.device)
+    if args.dry_run:
+        return report_dry_run(args, action, drives)
+
+    for drive in drives:
+        try:
+            set_door_lock(drive.device, args.locked)
+        except OSError as error:
+            hint = ""
+            if error.errno in (errno.EACCES, errno.EPERM):
+                hint = "Add your user to the cdrom group, or run this with sudo."
+            elif error.errno == errno.EBUSY:
+                # The cdrom driver only lets root unlock a drive that something else has open.
+                hint = "The disc is mounted or another program has the drive open. Unmount it, or run this with sudo."
+            raise HelperError(f"Could not {action} {drive.device}: {error.strerror or error}", hint=hint) from error
+        if not args.json:
+            if args.locked:
+                print(f"Locked {drive.device}. Eject requests are refused until you run unlock.")
+            else:
+                print(f"Unlocked {drive.device}.")
+    if args.json:
+        print(json.dumps({"locked": args.locked, "devices": [drive.device for drive in drives]}))
+    return 0
+
+
+def command_probe(args: argparse.Namespace) -> int:
+    drive = select_drives(args.device)[0]
+    commands = []
+    for name, *options in PROBE_COMMANDS:
+        path = shutil.which(name)
+        if path is not None:
+            commands.append((name, [path, *options, drive.device]))
+    if not commands:
+        raise HelperError("Probing the drive needs sg3-utils, which is not installed.",
+                          hint="Install sg3-utils from your distribution, for example: sudo apt install sg3-utils")
+
+    results = []
+    for name, command in commands:
+        display = " ".join([name, *command[1:]])
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True,
+                                       timeout=PROBE_TIMEOUT_SECONDS, check=False)
+        except subprocess.TimeoutExpired:
+            results.append({"command": display, "returncode": None, "stdout": "",
+                            "stderr": f"Timed out after {PROBE_TIMEOUT_SECONDS} seconds."})
+        else:
+            results.append({"command": display, "returncode": completed.returncode,
+                            "stdout": completed.stdout, "stderr": completed.stderr})
+
+    if args.json:
+        print(json.dumps({"device": drive.device, "results": results}))
+        return 0
+    for result in results:
+        print(f"$ {result['command']}")
+        print((result["stdout"] + result["stderr"]).rstrip())
+        print()
     return 0
 
 
@@ -448,10 +586,12 @@ def command_open(args: argparse.Namespace) -> int:
     mounted_at = media.mounted_at
     if mounted_at is None:
         if not media.fs_type:
-            raise HelperError("This disc has no file system to open. Blank and audio discs cannot be opened as files.")
+            raise HelperError("This disc has no file system to open.",
+                              hint="Blank and audio discs cannot be opened as files.")
         udisksctl = shutil.which("udisksctl")
         if udisksctl is None:
-            raise HelperError("udisksctl is not installed, so the disc cannot be mounted here. Mount it from your file manager.")
+            raise HelperError("udisksctl is not installed, so the disc cannot be mounted here.",
+                              hint="Mount it from your file manager.")
         completed = subprocess.run([udisksctl, "mount", "--block-device", drive.device],
                                    capture_output=True, text=True, timeout=60, check=False)
         if completed.returncode != 0:
@@ -461,51 +601,93 @@ def command_open(args: argparse.Namespace) -> int:
             raise HelperError(f"{drive.device} reported a mount, but it does not appear in /proc/self/mounts.")
 
     opener = shutil.which("xdg-open")
-    if opener is None:
-        print(mounted_at)
-        return 0
-    subprocess.Popen([opener, mounted_at], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    print(f"Opened {mounted_at}.")
+    if opener is not None:
+        subprocess.Popen([opener, mounted_at], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    if args.json:
+        print(json.dumps({"device": drive.device, "mounted_at": mounted_at, "opened": opener is not None}))
+    else:
+        print(f"Opened {mounted_at}." if opener is not None else mounted_at)
     return 0
 
 
+def report_dry_run(args: argparse.Namespace, action: str, drives: list[Drive]) -> int:
+    devices = [drive.device for drive in drives]
+    if args.json:
+        print(json.dumps({"dry_run": True, "action": action, "devices": devices}))
+    else:
+        for device in devices:
+            print(f"Would {action} {device}.")
+    return 0
+
+
+def report_error(error: HelperError, json_output: bool) -> None:
+    if json_output:
+        payload = {"error": {"message": error.message, "hint": error.hint, "details": error.details}}
+        print(json.dumps(payload), file=sys.stderr)
+        return
+    print(f"error: {error.message}", file=sys.stderr)
+    if error.hint:
+        print(f"hint: {error.hint}", file=sys.stderr)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="superdrive.py", description="Wake, eject and inspect an Apple USB SuperDrive.")
+    output = argparse.ArgumentParser(add_help=False)
+    output.add_argument("--json", action="store_true",
+                        help="print the result as JSON on stdout, and errors as JSON on stderr")
+    preview = argparse.ArgumentParser(add_help=False)
+    preview.add_argument("--dry-run", action="store_true", help="show which drives would be affected and stop")
+    every = "device node such as /dev/sr0; default: every SuperDrive"
+    first = "device node such as /dev/sr0; default: the first SuperDrive"
+
+    parser = ArgumentParser(prog="superdrive.py", description="Wake, eject and inspect an Apple USB SuperDrive.")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    status = commands.add_parser("status", help="show connected SuperDrives and their discs")
-    status.add_argument("--json", action="store_true", help="print machine-readable output")
+    status = commands.add_parser("status", parents=[output], help="show connected SuperDrives and their discs")
     status.set_defaults(handler=command_status)
 
-    wake = commands.add_parser("wake", help="send the wake command (needs root)")
-    wake.add_argument("--device", help="device node such as /dev/sr0; default: every SuperDrive")
+    wake = commands.add_parser("wake", parents=[output, preview], help="send the wake command (needs root)")
+    wake.add_argument("--device", help=every)
     wake.add_argument("--source", choices=("cli", "udev", "gui"), default="cli", help="who asked, for the wake record")
     wake.set_defaults(handler=command_wake)
 
-    eject = commands.add_parser("eject", help="unmount the disc and eject it")
-    eject.add_argument("--device", help="device node such as /dev/sr0; default: every SuperDrive")
+    eject = commands.add_parser("eject", parents=[output, preview], help="unmount the disc and eject it")
+    eject.add_argument("--device", help=every)
     eject.set_defaults(handler=command_eject)
 
-    open_disc = commands.add_parser("open", help="mount the disc if needed and open it in the file manager")
-    open_disc.add_argument("--device", help="device node such as /dev/sr0; default: the first SuperDrive")
+    lock = commands.add_parser("lock", parents=[output, preview], help="refuse eject requests until unlock")
+    lock.add_argument("--device", help=every)
+    lock.set_defaults(handler=command_lock, locked=True)
+
+    unlock = commands.add_parser("unlock", parents=[output, preview], help="allow eject requests again")
+    unlock.add_argument("--device", help=every)
+    unlock.set_defaults(handler=command_lock, locked=False)
+
+    probe = commands.add_parser("probe", parents=[output],
+                                help="show the drive's INQUIRY, VPD and mode pages (needs sg3-utils)")
+    probe.add_argument("--device", help=first)
+    probe.set_defaults(handler=command_probe)
+
+    open_disc = commands.add_parser("open", parents=[output],
+                                    help="mount the disc if needed and open it in the file manager")
+    open_disc.add_argument("--device", help=first)
     open_disc.set_defaults(handler=command_open)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-
-    # The polkit policy lets desktop users run this file as root without a password,
-    # so under pkexec it does only the one thing the policy is for.
-    if os.environ.get("PKEXEC_UID") and args.command != "wake":
-        print("error: through pkexec this helper only runs 'wake'.", file=sys.stderr)
-        return 2
-
+    argv = sys.argv[1:] if argv is None else argv
+    json_output = "--json" in argv
     try:
+        args = build_parser().parse_args(argv)
+        # The polkit policy lets desktop users run this file as root without a password,
+        # so under pkexec it does only the one thing the policy is for.
+        if os.environ.get("PKEXEC_UID") and args.command != "wake":
+            raise HelperError("Through pkexec this helper only runs 'wake'.", exit_code=EXIT_USAGE)
         return args.handler(args)
     except HelperError as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 1
+        report_error(error, json_output)
+        return error.exit_code
 
 
 def _read_attribute(path: Path) -> str:
